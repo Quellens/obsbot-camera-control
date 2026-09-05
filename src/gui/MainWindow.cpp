@@ -1064,6 +1064,10 @@ void MainWindow::onCameraConnected(const CameraController::CameraInfo &info)
             onStateChanged(state);
             m_isCameraSwitch = false;
         } else {
+            // Apply the persisted configuration to the camera first so the
+            // camera and UI reflect the saved settings (e.g. AI mode) instead
+            // of being overwritten by the camera's current state on read-back.
+            m_controller->applyConfigToCamera();
             m_controller->applyCurrentStateToCamera(getUIState());
         }
     });

@@ -96,7 +96,20 @@ void CameraController::connectToCamera(const QString &devicePath)
             updateState();
         }
     } else {
-        tryV4l2Fallback();
+        // The SDK enumerates devices asynchronously (its detection thread only
+        // starts on first access), so a freshly attached supported camera may
+        // not appear in getDevList() yet. Only degrade to the limited V4L2
+        // backend if the SDK still hasn't found a camera after a grace period.
+        if (!m_v4l2FallbackTimer) {
+            m_v4l2FallbackTimer = new QTimer(this);
+            m_v4l2FallbackTimer->setSingleShot(true);
+            connect(m_v4l2FallbackTimer, &QTimer::timeout, this, [this]() {
+                if (m_connected || m_v4l2Only)
+                    return;
+                tryV4l2Fallback();
+            });
+        }
+        m_v4l2FallbackTimer->start(1500);
     }
 }
 
@@ -207,6 +220,9 @@ void CameraController::updateV4l2State()
 
 void CameraController::disconnectFromCamera()
 {
+    if (m_v4l2FallbackTimer) {
+        m_v4l2FallbackTimer->stop();
+    }
     if (m_connected) {
         if (m_v4l2Only) {
             m_v4l2.close();
@@ -884,8 +900,12 @@ void CameraController::saveCurrentStateToConfig()
     settings.zoom = qBound(1.0, m_currentState.zoom, 2.0);
     settings.pan = m_currentState.pan;
     settings.tilt = m_currentState.tilt;
-    settings.aiMode = m_currentState.aiMode;
-    settings.aiSubMode = m_currentState.aiSubMode;
+    // The V4L2 backend cannot read AI state, so keep the persisted value
+    // instead of writing back a stale default of 0.
+    if (!m_v4l2Only) {
+        settings.aiMode = m_currentState.aiMode;
+        settings.aiSubMode = m_currentState.aiSubMode;
+    }
     settings.autoZoom = m_currentState.autoZoomEnabled;
     settings.trackSpeed = m_currentState.trackSpeedMode;
     settings.audioAutoGain = m_currentState.audioAutoGainEnabled;
