@@ -54,10 +54,19 @@ void CameraController::connectToCamera(const QString &devicePath)
     };
 
     auto onDevChanged = [this, pickDevice](std::string /*dev_sn*/, bool connected, void * /*param*/) {
+        qDebug() << "CameraController: onDevChanged connected=" << connected << "m_v4l2Only=" << m_v4l2Only;
         if (connected) {
             auto dev_list = Devices::get().getDevList();
             auto dev = pickDevice(dev_list);
             if (dev) {
+                // The SDK found a real OBSBOT camera. If we earlier fell back to
+                // the limited V4L2 backend (because the SDK was still enumerating),
+                // switch back to the full SDK device so AI tracking controls work.
+                if (m_v4l2Only) {
+                    qDebug() << "CameraController: SDK device found, leaving V4L2 fallback mode";
+                    m_v4l2.close();
+                    m_v4l2Only = false;
+                }
                 m_device = dev;
                 m_connected = true;
                 m_cameraInfo.name = QString::fromStdString(m_device->devName());
@@ -100,6 +109,9 @@ void CameraController::connectToCamera(const QString &devicePath)
         // starts on first access), so a freshly attached supported camera may
         // not appear in getDevList() yet. Only degrade to the limited V4L2
         // backend if the SDK still hasn't found a camera after a grace period.
+        // A generous grace period is important: falling back to V4L2 too early
+        // disables AI tracking (setAiMode/enableAutoFraming are no-ops there)
+        // even when the SDK later detects the camera.
         if (!m_v4l2FallbackTimer) {
             m_v4l2FallbackTimer = new QTimer(this);
             m_v4l2FallbackTimer->setSingleShot(true);
@@ -109,14 +121,16 @@ void CameraController::connectToCamera(const QString &devicePath)
                 tryV4l2Fallback();
             });
         }
-        m_v4l2FallbackTimer->start(1500);
+        m_v4l2FallbackTimer->start(6000);
     }
 }
 
 void CameraController::tryV4l2Fallback()
 {
+    qDebug() << "CameraController: tryV4l2Fallback, m_connected=" << m_connected << "m_v4l2Only=" << m_v4l2Only;
     auto path = V4l2Backend::findObsbotDevice();
     if (!path.empty()) {
+        qDebug() << "CameraController: tryV4l2Fallback found v4l2 device, connecting (this likely hides AI tracking)";
         connectV4l2(path);
         return;
     }
@@ -139,6 +153,14 @@ void CameraController::tryV4l2Fallback()
 
 void CameraController::connectV4l2(const std::string &devicePath)
 {
+    qDebug() << "CameraController: connectV4l2, m_connected=" << m_connected;
+    // If the SDK has already detected a real OBSBOT camera, prefer it - the
+    // full SDK offers AI tracking which V4L2 lacks. Don't drop into V4L2 mode
+    // just because its device notification arrived slightly later.
+    if (m_connected || !Devices::get().getDevList().empty()) {
+        qDebug() << "CameraController: SDK device present, skipping V4L2 fallback";
+        return;
+    }
     if (!m_v4l2.open(devicePath))
         return;
 
@@ -279,6 +301,15 @@ bool CameraController::hasTiny2Capabilities() const
 bool CameraController::enableAutoFraming(bool enabled)
 {
     if (!m_connected || m_v4l2Only) return false;
+
+    // Tiny 2 family controls AI tracking exclusively via cameraSetAiModeU();
+    // cameraSetMediaModeU() is only valid for the Meet series and would
+    // otherwise fight with setAiMode() and reset tracking on startup/toggle.
+    if (isTiny2Family()) {
+        m_currentState.autoFramingEnabled = enabled;
+        emit stateChanged(m_currentState);
+        return true;
+    }
 
     if (enabled) {
         // Step 1: Set MediaMode to AutoFrame
@@ -892,7 +923,12 @@ void CameraController::saveCurrentStateToConfig()
     Config::CameraSettings settings = m_config.getSettings();
 
     // Update only camera-related settings from current state
-    settings.faceTracking = m_currentState.autoFramingEnabled;
+    // faceTracking and trackSpeed are user-configured preferences for AI
+    // tracking. Some cameras (e.g. Tiny 2) do not reliably report these back
+    // (ai_tracker_speed can stay 0 and ai_mode can reset), so preserve the
+    // persisted values instead of overwriting them with a stale camera read.
+    settings.faceTracking = m_config.getSettings().faceTracking;
+    settings.trackSpeed = m_config.getSettings().trackSpeed;
     settings.hdr = m_currentState.hdrEnabled;
     settings.fov = m_currentState.fovMode;
     settings.faceAE = m_currentState.faceAEEnabled;
@@ -903,12 +939,11 @@ void CameraController::saveCurrentStateToConfig()
     // The V4L2 backend cannot read AI state, so keep the persisted value
     // instead of writing back a stale default of 0.
     if (!m_v4l2Only) {
-        settings.aiMode = m_currentState.aiMode;
-        settings.aiSubMode = m_currentState.aiSubMode;
+        settings.aiMode = m_config.getSettings().aiMode;
+        settings.aiSubMode = m_config.getSettings().aiSubMode;
     }
-    settings.autoZoom = m_currentState.autoZoomEnabled;
-    settings.trackSpeed = m_currentState.trackSpeedMode;
-    settings.audioAutoGain = m_currentState.audioAutoGainEnabled;
+    settings.autoZoom = m_config.getSettings().autoZoom;
+    settings.audioAutoGain = m_config.getSettings().audioAutoGain;
 
     // Image controls
     settings.brightnessAuto = m_currentState.brightnessAuto;
